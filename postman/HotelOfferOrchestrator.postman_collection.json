@@ -1,0 +1,624 @@
+{
+  "info": {
+    "_postman_id": "9dc1be67-a08e-43ca-ba77-71fc94129b26",
+    "name": "Hotel Offer Orchestrator",
+    "description": "Aggregates overlapping hotel offers from two mock suppliers, deduplicates them by name keeping the cheaper price, and serves price-range queries filtered inside Redis.\n\n## Running the collection\n\n1. Start the stack: `docker compose up --build`\n2. Import `HotelOfferOrchestrator.postman_environment.json` and select it, or set the `baseUrl` collection variable.\n3. Run the folder top to bottom \u2014 requests are ordered so request 1 populates the Redis cache that request 2 reads.\n\nFrom the CLI:\n\n```bash\nnewman run postman/HotelOfferOrchestrator.postman_collection.json \\\n  -e postman/HotelOfferOrchestrator.postman_environment.json\n```\n\n## Variables\n\n| Variable | Default | Notes |\n| --- | --- | --- |\n| `baseUrl` | `http://localhost:3000` | Change if `API_HOST_PORT` is overridden in `.env` |\n\n## Assertions\n\nEvery request asserts its status code; every request that returns offers also asserts the body is an array, that it carries the spec response shape (`name`, `price`, `supplier`, `commissionPct`), and that **no hotel name appears twice** \u2014 deduplication is the core requirement, so it is checked everywhere it applies.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Hotels \u2014 valid city with overlaps (delhi)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "delhi"
+            }
+          ]
+        },
+        "description": "Runs the Temporal workflow: both suppliers are called **in parallel**, their lists are deduplicated by hotel name keeping the cheaper price, the result is cached in Redis, and returned.\n\n`delhi` is the interesting fixture \u2014 6 hotels per supplier with 4 overlapping names, merging to **8 offers**:\n\n| Hotel | Supplier A | Supplier B | Winner |\n| --- | --- | --- | --- |\n| Holtin | 5200 | 4950 | B |\n| Radison | 6100 | 6400 | A |\n| Leela Palace | 9800 | 9800 | A (exact tie, broken deterministically) |\n| Taj Mahal Hotel | 12400 | 11900 | B |\n| The Imperial | 8700 | \u2014 | A only |\n| Bloomrooms Janpath | 3100 | \u2014 | A only |\n| Hyatt Regency | \u2014 | 7250 | B only |\n| Andaz Delhi | \u2014 | 10500 | B only |"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Body is a JSON array', function () {",
+              "    pm.expect(body).to.be.an('array');",
+              "});",
+              "",
+              "pm.test('No duplicate hotel names', function () {",
+              "    var names = body.map(function (o) { return String(o.name).trim().toLowerCase(); });",
+              "    var unique = names.filter(function (n, i) { return names.indexOf(n) === i; });",
+              "    pm.expect(unique.length, 'duplicates found in: ' + names.join(', ')).to.eql(names.length);",
+              "});",
+              "",
+              "pm.test('Every offer has the spec response shape', function () {",
+              "    body.forEach(function (offer) {",
+              "        pm.expect(offer).to.have.all.keys('name', 'price', 'supplier', 'commissionPct');",
+              "        pm.expect(offer.name).to.be.a('string').and.not.empty;",
+              "        pm.expect(offer.price).to.be.a('number');",
+              "        pm.expect(offer.commissionPct).to.be.a('number');",
+              "        pm.expect(offer.supplier).to.be.oneOf(['Supplier A', 'Supplier B']);",
+              "    });",
+              "});",
+              "",
+              "pm.test('Merges 6 + 6 supplier hotels into 8 deduplicated offers', function () {",
+              "    pm.expect(body).to.have.lengthOf(8);",
+              "});",
+              "",
+              "pm.test('Cheaper supplier wins each overlapping hotel', function () {",
+              "    var byName = {};",
+              "    body.forEach(function (o) { byName[o.name] = o; });",
+              "    pm.expect(byName['Holtin'].price, 'Holtin: B is cheaper').to.eql(4950);",
+              "    pm.expect(byName['Holtin'].supplier).to.eql('Supplier B');",
+              "    pm.expect(byName['Radison'].price, 'Radison: A is cheaper').to.eql(6100);",
+              "    pm.expect(byName['Radison'].supplier).to.eql('Supplier A');",
+              "    pm.expect(byName['Taj Mahal Hotel'].price).to.eql(11900);",
+              "});",
+              "",
+              "pm.test('Exact price ties resolve deterministically to Supplier A', function () {",
+              "    var leela = body.filter(function (o) { return o.name === 'Leela Palace'; })[0];",
+              "    pm.expect(leela.price).to.eql(9800);",
+              "    pm.expect(leela.supplier).to.eql('Supplier A');",
+              "});",
+              "",
+              "pm.test('Hotels offered by only one supplier are kept', function () {",
+              "    var names = body.map(function (o) { return o.name; });",
+              "    pm.expect(names).to.include.members(",
+              "        ['The Imperial', 'Bloomrooms Janpath', 'Hyatt Regency', 'Andaz Delhi']);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "2. Hotels \u2014 price filter 5000-6000",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=5000&maxPrice=6000",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "delhi"
+            },
+            {
+              "key": "minPrice",
+              "value": "5000"
+            },
+            {
+              "key": "maxPrice",
+              "value": "6000"
+            }
+          ]
+        },
+        "description": "Price filtering happens **inside Redis** via `ZRANGEBYSCORE hotels:delhi 5000 6000` over a sorted set scored by price \u2014 the full list is never loaded into the process and filtered in JavaScript. If the city is not cached yet, the workflow runs first to populate Redis and the same `ZRANGEBYSCORE` then answers the request.\n\nBoth bounds are inclusive, and either may be omitted (`-inf` / `+inf`).\n\n> **Note:** against the shipped `delhi` fixtures this range is legitimately **empty** \u2014 the deduplicated prices are 3100, 4950, 6100, 7250, 8700, 9800, 10500 and 11900, so nothing falls between 5000 and 6000. The assertions below verify the filter behaves correctly (array, in-range, no duplicates) rather than asserting a non-empty result. Use request 2b for a populated range."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Body is a JSON array', function () {",
+              "    pm.expect(body).to.be.an('array');",
+              "});",
+              "",
+              "pm.test('No duplicate hotel names', function () {",
+              "    var names = body.map(function (o) { return String(o.name).trim().toLowerCase(); });",
+              "    var unique = names.filter(function (n, i) { return names.indexOf(n) === i; });",
+              "    pm.expect(unique.length, 'duplicates found in: ' + names.join(', ')).to.eql(names.length);",
+              "});",
+              "",
+              "pm.test('Every offer has the spec response shape', function () {",
+              "    body.forEach(function (offer) {",
+              "        pm.expect(offer).to.have.all.keys('name', 'price', 'supplier', 'commissionPct');",
+              "        pm.expect(offer.name).to.be.a('string').and.not.empty;",
+              "        pm.expect(offer.price).to.be.a('number');",
+              "        pm.expect(offer.commissionPct).to.be.a('number');",
+              "        pm.expect(offer.supplier).to.be.oneOf(['Supplier A', 'Supplier B']);",
+              "    });",
+              "});",
+              "",
+              "pm.test('Every returned price is inside the requested range', function () {",
+              "    body.forEach(function (offer) {",
+              "        pm.expect(offer.price, offer.name).to.be.at.least(5000);",
+              "        pm.expect(offer.price, offer.name).to.be.at.most(6000);",
+              "    });",
+              "});",
+              "",
+              "pm.test('Filtered result is a subset of the unfiltered catalogue', function () {",
+              "    pm.expect(body.length).to.be.at.most(8);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "2b. Hotels \u2014 price filter 4000-9000 (populated range)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=delhi&minPrice=4000&maxPrice=9000",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "delhi"
+            },
+            {
+              "key": "minPrice",
+              "value": "4000"
+            },
+            {
+              "key": "maxPrice",
+              "value": "9000"
+            }
+          ]
+        },
+        "description": "Same Redis-side `ZRANGEBYSCORE` path as request 2, with a range the fixture data actually populates. Expects exactly 4 offers: Holtin (4950), Radison (6100), Hyatt Regency (7250) and The Imperial (8700). Bounds are inclusive."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Body is a JSON array', function () {",
+              "    pm.expect(body).to.be.an('array');",
+              "});",
+              "",
+              "pm.test('No duplicate hotel names', function () {",
+              "    var names = body.map(function (o) { return String(o.name).trim().toLowerCase(); });",
+              "    var unique = names.filter(function (n, i) { return names.indexOf(n) === i; });",
+              "    pm.expect(unique.length, 'duplicates found in: ' + names.join(', ')).to.eql(names.length);",
+              "});",
+              "",
+              "pm.test('Every offer has the spec response shape', function () {",
+              "    body.forEach(function (offer) {",
+              "        pm.expect(offer).to.have.all.keys('name', 'price', 'supplier', 'commissionPct');",
+              "        pm.expect(offer.name).to.be.a('string').and.not.empty;",
+              "        pm.expect(offer.price).to.be.a('number');",
+              "        pm.expect(offer.commissionPct).to.be.a('number');",
+              "        pm.expect(offer.supplier).to.be.oneOf(['Supplier A', 'Supplier B']);",
+              "    });",
+              "});",
+              "",
+              "pm.test('Returns the 4 hotels priced between 4000 and 9000', function () {",
+              "    pm.expect(body).to.have.lengthOf(4);",
+              "    var names = body.map(function (o) { return o.name; }).sort();",
+              "    pm.expect(names).to.eql(['Holtin', 'Hyatt Regency', 'Radison', 'The Imperial']);",
+              "});",
+              "",
+              "pm.test('Every returned price is inside the requested range', function () {",
+              "    body.forEach(function (offer) {",
+              "        pm.expect(offer.price, offer.name).to.be.within(4000, 9000);",
+              "    });",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "3. Hotels \u2014 city with no results (atlantis)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/api/hotels?city=atlantis",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "atlantis"
+            }
+          ]
+        },
+        "description": "An unknown city is **not** an error. Both suppliers return `[]`, the workflow dedupes nothing, and the API answers `200 []`.\n\nA marker key (`hotels:atlantis:meta`) is still written to Redis with `count: 0`, so repeat requests for an unknown city are served from the cache instead of re-running the workflow every time \u2014 an empty city has no sorted set, so the marker is what records that we looked."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Body is a JSON array', function () {",
+              "    pm.expect(body).to.be.an('array');",
+              "});",
+              "",
+              "pm.test('No duplicate hotel names', function () {",
+              "    var names = body.map(function (o) { return String(o.name).trim().toLowerCase(); });",
+              "    var unique = names.filter(function (n, i) { return names.indexOf(n) === i; });",
+              "    pm.expect(unique.length, 'duplicates found in: ' + names.join(', ')).to.eql(names.length);",
+              "});",
+              "",
+              "pm.test('Unknown city returns an empty array, not an error', function () {",
+              "    pm.expect(body).to.be.an('array').that.is.empty;",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "4. Health \u2014 live dependency probes",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Actively probes **both suppliers, Redis and Temporal** on every call \u2014 nothing is cached or hardcoded \u2014 and reports each with its latency.\n\n| `status` | HTTP | Meaning |\n| --- | --- | --- |\n| `ok` | 200 | Everything reachable |\n| `degraded` | 200 | One supplier down \u2014 still serving, from the other |\n| `down` | 503 | Redis or Temporal down, or *both* suppliers down |\n\n`degraded` stays 200 deliberately: losing one supplier is exactly the failure the workflow absorbs, so it must not take the container out of rotation.\n\nThis request is the one that does **not** return an array, so the array/duplicate-name assertions are replaced with shape assertions on the report."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code reflects health (200 ok/degraded, 503 down)', function () {",
+              "    pm.expect(pm.response.code).to.be.oneOf([200, 503]);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Reports every dependency', function () {",
+              "    pm.expect(body).to.have.property('status');",
+              "    pm.expect(body).to.have.nested.property('suppliers.A.status');",
+              "    pm.expect(body).to.have.nested.property('suppliers.B.status');",
+              "    pm.expect(body).to.have.nested.property('redis.status');",
+              "    pm.expect(body).to.have.nested.property('temporal.status');",
+              "});",
+              "",
+              "pm.test('Each dependency is up or down, with a latency', function () {",
+              "    [body.suppliers.A, body.suppliers.B, body.redis, body.temporal].forEach(function (dep) {",
+              "        pm.expect(dep.status).to.be.oneOf(['up', 'down']);",
+              "        pm.expect(dep.latencyMs).to.be.a('number');",
+              "    });",
+              "});",
+              "",
+              "pm.test('Overall status agrees with the HTTP code', function () {",
+              "    pm.expect(body.status).to.be.oneOf(['ok', 'degraded', 'down']);",
+              "    if (body.status === 'down') {",
+              "        pm.expect(pm.response.code).to.eql(503);",
+              "    } else {",
+              "        pm.expect(pm.response.code).to.eql(200);",
+              "    }",
+              "});",
+              "",
+              "pm.test('Status is consistent with the individual probes', function () {",
+              "    var suppliersDown = [body.suppliers.A, body.suppliers.B]",
+              "        .filter(function (s) { return s.status === 'down'; }).length;",
+              "    var criticalDown = body.redis.status === 'down' || body.temporal.status === 'down';",
+              "    if (criticalDown || suppliersDown === 2) {",
+              "        pm.expect(body.status).to.eql('down');",
+              "    } else if (suppliersDown === 1) {",
+              "        pm.expect(body.status).to.eql('degraded');",
+              "    } else {",
+              "        pm.expect(body.status).to.eql('ok');",
+              "    }",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "5a. Supplier A \u2014 raw feed",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/supplierA/hotels?city=delhi",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "supplierA",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "delhi"
+            }
+          ]
+        },
+        "description": "The unaggregated Supplier A feed, exactly as the Temporal activity sees it. Returns `RawHotel` records (`hotelId`, `name`, `price`, `city`, `commissionPct`) \u2014 note this is the *raw* shape, before normalization into the `HotelOffer` response format.\n\nCompare this against Supplier B to see the overlapping names at different prices that request 1 deduplicates. Unknown cities return `[]`.\n\nTwo test switches are available here:\n- `?delayMs=1500` \u2014 simulate supplier latency (makes the parallel fan-out visible)\n- `?fail=1` \u2014 return 503 (see request 6)"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Body is a JSON array', function () {",
+              "    pm.expect(body).to.be.an('array');",
+              "});",
+              "",
+              "pm.test('No duplicate hotel names', function () {",
+              "    var names = body.map(function (o) { return String(o.name).trim().toLowerCase(); });",
+              "    var unique = names.filter(function (n, i) { return names.indexOf(n) === i; });",
+              "    pm.expect(unique.length, 'duplicates found in: ' + names.join(', ')).to.eql(names.length);",
+              "});",
+              "",
+              "pm.test('Every record has the RawHotel shape', function () {",
+              "    body.forEach(function (hotel) {",
+              "        pm.expect(hotel).to.have.all.keys('hotelId', 'name', 'price', 'city', 'commissionPct');",
+              "        pm.expect(hotel.hotelId).to.be.a('string').and.not.empty;",
+              "        pm.expect(hotel.price).to.be.a('number');",
+              "        pm.expect(hotel.city).to.eql('delhi');",
+              "    });",
+              "});",
+              "",
+              "pm.test('Supplier A offers 6 hotels for delhi', function () {",
+              "    pm.expect(body).to.have.lengthOf(6);",
+              "});",
+              "",
+              "pm.test('Includes names that overlap the other supplier', function () {",
+              "    var names = body.map(function (h) { return h.name; });",
+              "    pm.expect(names).to.include.members(['Holtin', 'Radison', 'Leela Palace', 'Taj Mahal Hotel']);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "5b. Supplier B \u2014 raw feed",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/supplierB/hotels?city=delhi",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "supplierB",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "delhi"
+            }
+          ]
+        },
+        "description": "The unaggregated Supplier B feed, exactly as the Temporal activity sees it. Returns `RawHotel` records (`hotelId`, `name`, `price`, `city`, `commissionPct`) \u2014 note this is the *raw* shape, before normalization into the `HotelOffer` response format.\n\nCompare this against Supplier A to see the overlapping names at different prices that request 1 deduplicates. Unknown cities return `[]`.\n\nTwo test switches are available here:\n- `?delayMs=1500` \u2014 simulate supplier latency (makes the parallel fan-out visible)\n- `?fail=1` \u2014 return 503 (see request 6)"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status code is 200', function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Body is a JSON array', function () {",
+              "    pm.expect(body).to.be.an('array');",
+              "});",
+              "",
+              "pm.test('No duplicate hotel names', function () {",
+              "    var names = body.map(function (o) { return String(o.name).trim().toLowerCase(); });",
+              "    var unique = names.filter(function (n, i) { return names.indexOf(n) === i; });",
+              "    pm.expect(unique.length, 'duplicates found in: ' + names.join(', ')).to.eql(names.length);",
+              "});",
+              "",
+              "pm.test('Every record has the RawHotel shape', function () {",
+              "    body.forEach(function (hotel) {",
+              "        pm.expect(hotel).to.have.all.keys('hotelId', 'name', 'price', 'city', 'commissionPct');",
+              "        pm.expect(hotel.hotelId).to.be.a('string').and.not.empty;",
+              "        pm.expect(hotel.price).to.be.a('number');",
+              "        pm.expect(hotel.city).to.eql('delhi');",
+              "    });",
+              "});",
+              "",
+              "pm.test('Supplier B offers 6 hotels for delhi', function () {",
+              "    pm.expect(body).to.have.lengthOf(6);",
+              "});",
+              "",
+              "pm.test('Includes names that overlap the other supplier', function () {",
+              "    var names = body.map(function (h) { return h.name; });",
+              "    pm.expect(names).to.include.members(['Holtin', 'Radison', 'Leela Palace', 'Taj Mahal Hotel']);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    },
+    {
+      "name": "6. Simulate supplier down \u2014 graceful degradation",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Accept",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/supplierA/hotels?city=delhi&fail=1",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "supplierA",
+            "hotels"
+          ],
+          "query": [
+            {
+              "key": "city",
+              "value": "delhi"
+            },
+            {
+              "key": "fail",
+              "value": "1"
+            }
+          ]
+        },
+        "description": "`?fail=1` makes a mock supplier answer **503**, so supplier outages can be exercised without stopping a process.\n\n### What this request alone does \u2014 and does not \u2014 prove\n\nCalling this endpoint directly only shows the mock returning 503. It does **not** by itself make `GET /api/hotels` degrade, because the Temporal worker reads `SUPPLIER_A_URL` from its environment **at startup** and keeps calling its own configured URL.\n\n### Making the workflow actually degrade\n\nRestart the worker with the failing URL baked in, then re-run request 1:\n\n```bash\ndocker compose run --rm -e \\\n  SUPPLIER_A_URL='http://app-api:3000/supplierA/hotels?fail=1' \\\n  app-worker node dist/temporal/worker.js\n```\n\nOr without Docker:\n\n```bash\nSUPPLIER_A_URL='http://localhost:3000/supplierA/hotels?fail=1' npm run dev:worker\n```\n\n### Expected degraded behaviour\n\n- The `fetchSupplierA` activity retries **3 times** with exponential backoff, then gives up.\n- The workflow logs `supplier unavailable, continuing with the other supplier` and **still succeeds** using Supplier B alone.\n- `GET /api/hotels?city=delhi` returns **200** with Supplier B's **6** offers instead of 8 \u2014 every `supplier` field reads `Supplier B`.\n- The partial snapshot is still cached, so price filtering keeps working.\n- `GET /health` reports `status: \"degraded\"` with `suppliers.A.status: \"down\"` \u2014 and stays **200**, because one supplier down is a condition the system handles.\n- Only if **both** suppliers fail does the workflow fail, and the API answers **502** `suppliers_unavailable`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Failing supplier responds 503', function () {",
+              "    pm.response.to.have.status(503);",
+              "});",
+              "",
+              "var body = pm.response.json();",
+              "",
+              "pm.test('Returns a structured error body, not an array', function () {",
+              "    pm.expect(body).to.be.an('object');",
+              "    pm.expect(body).to.have.property('error', 'supplier_unavailable');",
+              "    pm.expect(body).to.have.property('message');",
+              "});",
+              "",
+              "pm.test('The healthy supplier is unaffected', function () {",
+              "    pm.sendRequest({",
+              "        url: pm.variables.replaceIn('{{baseUrl}}/supplierB/hotels?city=delhi'),",
+              "        method: 'GET',",
+              "    }, function (err, res) {",
+              "        pm.expect(err).to.be.null;",
+              "        pm.expect(res).to.have.status(200);",
+              "        pm.expect(res.json()).to.be.an('array').with.lengthOf(6);",
+              "    });",
+              "});"
+            ]
+          }
+        }
+      ],
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string",
+      "description": "Base URL of the API. Matches the compose default (API_HOST_PORT=3000)."
+    }
+  ]
+}

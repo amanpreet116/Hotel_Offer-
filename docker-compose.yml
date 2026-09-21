@@ -1,0 +1,161 @@
+# Hotel Offer Orchestrator — full stack.
+#
+#   docker compose up --build
+#   curl 'http://localhost:3000/api/hotels?city=delhi'
+#
+# Every host port is overridable from .env (see .env.example) for machines
+# where 3000/7233/8080/6379 are already taken.
+
+name: hotel-offer-orchestrator
+
+services:
+  # --- Datastore for Temporal ------------------------------------------------
+  postgresql:
+    image: postgres:16-alpine
+    environment:
+      # Local development credentials for a database that is never published to
+      # the host. Overridable so nothing sensitive is ever pinned in the repo.
+      POSTGRES_USER: ${POSTGRES_USER:-temporal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-temporal}
+      POSTGRES_DB: ${POSTGRES_DB:-temporal}
+    volumes:
+      - temporal-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U temporal']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # --- Redis: the price-scored sorted set lives here -------------------------
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '${REDIS_HOST_PORT:-6379}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # --- Temporal server -------------------------------------------------------
+  # auto-setup creates the schema and the "default" namespace on first boot, so
+  # there is no manual provisioning step.
+  temporal:
+    image: temporalio/auto-setup:1.29.1
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-temporal}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-temporal}
+      POSTGRES_SEEDS: postgresql
+      # No DYNAMIC_CONFIG_FILE_PATH: the image's own default
+      # (config/dynamicconfig/docker.yaml) is the only file it ships. Pointing
+      # at development-sql.yaml, as older reference composes do, makes 1.29
+      # exit at startup.
+    ports:
+      - '${TEMPORAL_GRPC_PORT:-7233}:7233'
+    healthcheck:
+      # Passes only once the frontend serves gRPC *and* the default namespace
+      # exists — "port is open" alone is not enough to start a worker against.
+      # Addressed by service name, not 127.0.0.1: the frontend binds the
+      # container's network IP, so loopback is refused from inside.
+      test: ['CMD', 'temporal', 'operator', 'namespace', 'describe', '-n', 'default', '--address', 'temporal:7233']
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  # --- Temporal Web UI (debugging: inspect workflow runs and their history) --
+  temporal-ui:
+    image: temporalio/ui:2.54.1
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${TEMPORAL_UI_PORT:-8080}
+    ports:
+      - '${TEMPORAL_UI_PORT:-8080}:8080'
+    restart: unless-stopped
+
+  # --- Express API (also hosts the two mock supplier endpoints) --------------
+  app-api:
+    build:
+      context: .
+      target: runtime
+    image: hotel-offer-orchestrator:latest
+    init: true
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
+      REDIS_URL: redis://redis:6379
+      REDIS_TTL_SECONDS: '${REDIS_TTL_SECONDS:-300}'
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: hotel-offers
+      # The API reaches its own supplier routes; the worker reaches them over
+      # the compose network by service name.
+      SUPPLIER_A_URL: http://app-api:3000/supplierA/hotels
+      SUPPLIER_B_URL: http://app-api:3000/supplierB/hotels
+    ports:
+      - '${API_HOST_PORT:-3000}:3000'
+    healthcheck:
+      # node:20-slim ships no curl; Node 20 has global fetch, which is enough.
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # --- Temporal worker: same image, different command ------------------------
+  app-worker:
+    # Deliberately no `build:` — app-api builds this exact tag, and Compose
+    # completes the build phase before creating containers. Declaring the same
+    # build on both services makes Compose run two concurrent builds of an
+    # identical image, which is wasted work and a source of flaky `npm ci`
+    # failures under load.
+    image: hotel-offer-orchestrator:latest
+    init: true
+    command: ['node', 'dist/temporal/worker.js']
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: '${LOG_LEVEL:-info}'
+      REDIS_URL: redis://redis:6379
+      REDIS_TTL_SECONDS: '${REDIS_TTL_SECONDS:-300}'
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: hotel-offers
+      SUPPLIER_A_URL: http://app-api:3000/supplierA/hotels
+      SUPPLIER_B_URL: http://app-api:3000/supplierB/hotels
+    restart: unless-stopped
+
+volumes:
+  temporal-pgdata:
+  redis-data:

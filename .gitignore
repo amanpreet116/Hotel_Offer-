@@ -1,0 +1,21 @@
+# dependencies & build output
+node_modules/
+dist/
+
+# local environment — never commit real values; see .env.example
+.env
+.env.*
+!.env.example
+
+# tooling output
+coverage/
+*.log
+.eslintcache
+
+# editors & OS
+.vscode/
+.idea/
+.DS_Store
+
+
+CLAUDE.md
